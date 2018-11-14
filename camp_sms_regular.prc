@@ -1,4 +1,5 @@
 create or replace procedure CAMP_SMS_REGULAR as
+
     delivery varchar(30); dt_current timestamp;     dt_start date;                  dt_end date; 
     horus number;         sms_count number;         day_count number;               csize number;
     hsize number;         contact_num varchar2(50); contact_name varchar2(150);     day_types varchar2(50);
@@ -40,12 +41,101 @@ begin
        goto finish_line;
     end if;
 
+    /* Get day count to spread the sms sending */
+    with all_day as
+    (
+        select /*+ MATERIALZIE */ to_char(dt_current,'yymm')campaign_id, trunc(dt_current,'MM') + (level-1) as date_d
+        from dual
+        connect by (level-1) <= 31
+    ),
+    t1 as
+    (
+        select /*+ MATERIALZIE */ to_char(dt_current,'yymm')campaign_id, trunc(dt_current,'MM') + ((level-1)*5) as date_d
+        from dual
+        connect by ((level-1)*5) <= 31
+    ),
+    t2 as
+    (
+        select to_char(dt_current,'yymm')campaign_id, date_d date_start,
+        case when rownum < 6 then date_d + 4 else date_d + 5 end date_end,
+        rownum  sms_cycle
+        from t1 where rownum <= 6
+    )
+    select t2.date_start, t2.date_end, t2.sms_cycle, count(date_d)
+          into dt_start, dt_end, sms_count, day_count
+    from all_day
+    inner join t2 on all_Day.campaign_id = t2.campaign_id and all_Day.date_d between t2.date_start and t2.date_end
+    where all_Day.date_d between trunc(dt_current) and (select date_end from t2 where trunc(dt_current) between date_start and date_end)
+    and ALL_DAY.date_d NOT in (SELECT trunc(DATE_SKIP) FROM CAMP_CFG_SMS_SKIP WHERE SMS_TYPE = 'SMS OFFER CAMPAIGN' and last_Day(trunc(date_skip)) = last_day(trunc(dt_current)))
+    group by t2.date_start, t2.date_end, t2.sms_cycle;
+
+    select count(cal.date_id) into day_count from camp_calendar cal 
+    where (cal.date_id between trunc(sysdate) and dt_end)
+      and cal.isholiday = 0 and cal.isweekday = 1;
+    /********************************************************************************************************************************************************************************/
+    dbms_output.put_line(dt_start);
+    dbms_output.put_line(dt_end);
+    --goto finish_line;
+    /* Flush sms record with delivery time of today if any */
+    AP_PUBLIC.CORE_LOG_PKG.pStart('Flush sms record with delivery time of today if any');
+    delete from ap_crm.camp_sms_ad_hoc_crm       
+    where delivery_time >= trunc(dt_current)
+        and code_promo in
+           (
+                select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type ='OFFER REGULAR'
+                union all
+                select 'FF_OFFER_RBP' from dual
+           );
+    AP_PUBLIC.CORE_LOG_PKG.pEnd;
+    commit;
+    --pStats('camp_sms_ad_hoc_crm');
+
+    /* Generate list of sms to send */
+    ptruncate('gtt_camp_sms_base');
+    AP_PUBLIC.CORE_LOG_PKG.pStart('Building sms base list');
+    insert /*+ APPEND */ into gtt_camp_sms_base
+    with exc as
+    (
+        select /*+ MATERIALIZE */ to_number(cuid)cuid from ap_crm.camp_sms_ad_hoc_crm where (delivery_time >= dt_start and delivery_time <= (dt_end+1) - (1/24/60/60))
+        and code_promo in
+            (
+                (select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type = 'OFFER REGULAR')
+                union all
+                select 'FF_OFFER_RBP' from dual
+            )
+        union all
+        SELECT to_number(ID_CUID) FROM AP_CRM.CAMP_SMS_FF_BASE
+        WHERE CAMPAIGN_ID = TO_CHAR(dt_current, 'YYMM') AND CALL_TO_ACTION IN ('APP', 'LANDING', 'INBOUND')
+        union all
+        /* find From Mobile App Form */
+        select nvl(to_number(CUID),-99999) from AP_CRM.V_CAMP_MOBILE_APP      
+    )
+    select /*+ USE_HASH(CCL AX)  */ distinct ccl.skp_client, ax.cuid, ax.contract_id, ax.mobile1, pilot_flag, to_number(ccl.TDY_PRIORITY)TDY_PRIORITY
+           ,'REG' flag_sms
+    from camp_tdy_call_list ax
+    inner join camp_compiled_list ccl on ax.cuid = ccl.id_cuid
+    where 1=1
+    and (lower(ax.info2) not like '6.fol%' or lower(ax.info2) not like '%disaster%' or lower(ax.info2) not like '%landing_page 1-30%')
+    and coalesce(ccl.dt_complaint, ccl.dt_dwto, ccl.dt_dwto2) is null
+    and ax.cuid not in (select nvl(cuid,-999999) from exc)
+    ;
+    AP_PUBLIC.CORE_LOG_PKG.pEnd;
+    commit;
+    pStats('gtt_camp_sms_base');
+    
+    select count(1) into csize from ap_crm.gtt_camp_sms_base;
+    if csize = 0 then
+      goto finish_line;
+    end if;
+    csize := 0;
+    
     AP_PUBLIC.CORE_LOG_PKG.pStart('DEL:CAMP_SMS_REG_TEXT');
     delete from camp_sms_reg_text where campaign_id = to_char(dt_current,'yymm') and phone_update is null;
     AP_PUBLIC.CORE_LOG_PKG.pEnd;
     commit;
     pStats('CAMP_SMS_REG_TEXT');
-
+    
+    /* Update sms text contents */
     pTruncate(upper('gtt_camp_sms_reg_text'));
     AP_PUBLIC.CORE_LOG_PKG.pStart('Insert into gtt_camp_sms_reg_text');
     insert into gtt_camp_sms_reg_text
@@ -60,7 +150,8 @@ begin
         max_tenor tenor
       from ap_crm.camp_elig_base eb
       WHERE 1=1
-        and (eb.skp_client, valid_from) in 
+        and eb.skp_client in (select skp_client from gtt_camp_sms_base)
+        /*and (eb.skp_client, valid_from) in 
             (
                  select skp_client, max(valid_from)valid_from from camp_elig_base 
                  where eligible_final_flag = 1 and priority_actual > 0 
@@ -70,7 +161,7 @@ begin
             (
                  select nvl(id_cuid,-999999999) from camp_elig_daily_check 
                  where trunc(sysdate) between date_valid_from and date_valid_to and nvl(flag_still_eligible,'U') = 'N'
-            )
+            )*/
     ),
     upload_hosel as
     (
@@ -108,19 +199,11 @@ begin
         case  when a.INSTALMENT >=1000000 then round((a.INSTALMENT/1000000),2)||'jt/bln'
               when a.INSTALMENT <1000000 then floor(a.INSTALMENT/1000)||'rb/bln'
         end as ins,
-/*        case  when mod(a.id_cuid, 100) < 10 then 'Limit_2' -- prevously regular
-              when mod(a.id_cuid, 100) >= 10 and mod(a.id_cuid, 100) < 30 then 'Limit_2'
-              when mod(a.id_cuid, 100) >= 30 and mod(a.id_cuid, 100) < 60  then 'Limit_2'
-              when mod(a.id_cuid, 100) >= 60 and mod(a.id_cuid, 100) < 90  then 'Dynamic'
-              when mod(a.id_cuid, 100) >= 90 then 'Limit_2' -- prevously dynamic
-        end as random_split,*/
         'Dynamic' random_split,
---        pilot.final_flag
         'other' final_flag
         from A
         inner join AP_CRM.CAMP_CLIENT_IDENTITY cci on a.skp_client = cci.skp_client
         inner join AP_CRM.V_CAMP_FINAL_PHONENUM cfp on a.id_cuid = cfp.id_cuid
-        --inner join ap_Crm.camp_pilot_list pilot on a.id_cuid = pilot.id_cuid and pilot.CAMPAIGN_ID = to_Char(sysdate,'yymm')
         where nvl(A.skp_client,-9999) in (select nvl(skp_Client,'-9999') from upload_hosel)
         and (cfp.PHONE1 is not null or cfp.PHONE2 is not null)
     )
@@ -275,119 +358,17 @@ begin
             src.campaign_id, src.id_cuid, src.priority, src.phone_update, src.random_split, src.final_flag, src.random_split_new, src.sms_1_5, src.sms_6_10,
             src.sms_11_15, src.sms_16_20, src.sms_21_25, src.sms_26_30, src.msc_1_5, src.msc_6_10, src.msc_11_15, src.msc_16_20, src.msc_21_25, src.msc_26_30
         );
-  AP_PUBLIC.CORE_LOG_PKG.pEnd;
-  commit;
-  pStats('CAMP_SMS_REG_TEXT');
-
-    /* Get day count to spread the sms sending */
-    with all_day as
-    (
-        select /*+ MATERIALZIE */ to_char(dt_current,'yymm')campaign_id, trunc(dt_current,'MM') + (level-1) as date_d
-        from dual
-        connect by (level-1) <= 31
-    ),
-    t1 as
-    (
-        select /*+ MATERIALZIE */ to_char(dt_current,'yymm')campaign_id, trunc(dt_current,'MM') + ((level-1)*5) as date_d
-        from dual
-        connect by ((level-1)*5) <= 31
-    ),
-    t2 as
-    (
-        select to_char(dt_current,'yymm')campaign_id, date_d date_start,
-        case when rownum < 6 then date_d + 4 else date_d + 5 end date_end,
-        rownum  sms_cycle
-        from t1 where rownum <= 6
-    )
-    select t2.date_start, t2.date_end, t2.sms_cycle, count(date_d)
-          into dt_start, dt_end, sms_count, day_count
-    from all_day
-    inner join t2 on all_Day.campaign_id = t2.campaign_id and all_Day.date_d between t2.date_start and t2.date_end
-    where all_Day.date_d between trunc(dt_current) and (select date_end from t2 where trunc(dt_current) between date_start and date_end)
-    and ALL_DAY.date_d NOT in (SELECT trunc(DATE_SKIP) FROM CAMP_CFG_SMS_SKIP WHERE SMS_TYPE = 'SMS OFFER CAMPAIGN' and last_Day(trunc(date_skip)) = last_day(trunc(dt_current)))
-    group by t2.date_start, t2.date_end, t2.sms_cycle;
-    /********************************************************************************************************************************************************************************/
-
-    /********************************************************************************************************************************************************************************/
-    select count(cal.date_id) into day_count from camp_calendar cal 
-    where (cal.date_id between trunc(sysdate) and dt_end)
-      and cal.isholiday = 0 and cal.isweekday = 1;
-			
-		if trunc(sysdate)	< to_Date('07/14/2018','mm/dd/yyyy') then
-			 select count(cal.date_id)-1 into day_count from camp_calendar cal 
-				where (cal.date_id between trunc(sysdate) and dt_end)
-					and cal.isholiday = 0 and cal.isweekday = 1;
-		end if;
-    /********************************************************************************************************************************************************************************/
-
-    /******************************************************************************************************************************/
-    AP_PUBLIC.CORE_LOG_PKG.pStart('Flush sms record with delivery time of today if any');
-    delete from ap_crm.camp_sms_ad_hoc_crm       
-		where delivery_time >= dt_current
-        and code_promo in
-           (
-                select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type ='OFFER REGULAR'
-                union all
-                select 'FF_OFFER_RBP' from dual
-           );
     AP_PUBLIC.CORE_LOG_PKG.pEnd;
     commit;
-    pStats('camp_sms_ad_hoc_crm');
-    /******************************************************************************************************************************/
-
-    /* Generate list of sms to send */
-    ptruncate('gtt_camp_sms_base');
-    AP_PUBLIC.CORE_LOG_PKG.pStart('Building sms base list');
-    insert /*+ APPEND PARALLEL(4) */ into gtt_camp_sms_base
-    select /*+ USE_HASH(AX CCL CCI)  */ distinct cci.skp_client, ax.cuid, ax.contract_id, ax.mobile1, pilot_flag, to_number(ccl.TDY_PRIORITY)TDY_PRIORITY
-           ,'REG' flag_sms
-    from camp_tdy_call_list ax
-    inner join camp_client_identity cci on ax.cuid = cci.id_cuid
-    inner join camp_compiled_list ccl on cci.skp_Client = ccl.skp_client
-    where 1=1
---    and lower(ccl.pilot_name) not in ('a+')
---    and lower(ax.last_name) not like 'price test%'
-    and (lower(ax.info2) not like '6.Fol%' or lower(ax.info2) not like '%disaster%')
-		and coalesce(ccl.dt_complaint, ccl.dt_dwto, ccl.dt_dwto2) is null
-/*    and cci.skp_client in \* Deactivated to accomodate cross campaign month eligibility *\
-    (
-          select eb.skp_client from camp_elig_base eb
-          where 1=1
-          and eligible_final_flag = 1
-          --and priority_actual > 4
-          and valid_from = trunc(dt_current,'MM')
-    )*/
-    and ax.cuid not in
-    (
-        select cuid from ap_crm.camp_sms_ad_hoc_crm where trunc(delivery_time) between dt_start and dt_end
-        and code_promo in
-            (
-                (select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type ='OFFER REGULAR')
-                union all
-                select 'FF_OFFER_RBP' from dual
-            )
-    )
-    and ax.cuid not in
-    (
-        SELECT ID_CUID FROM AP_CRM.CAMP_SMS_FF_BASE
-        WHERE CAMPAIGN_ID = TO_CHAR(dt_current, 'YYMM')
-              AND CALL_TO_ACTION IN ('APP', 'LANDING', 'INBOUND')
-    )
-    --and cci.skp_client not in (select nvl(skp_client,-9999999) from camp_list_pilot where pilot_name in ('SMS_PILOT_SAMSUNG') and date_end = last_day(trunc(dt_current)))
-    and cci.skp_client not in (select nvl(skp_client,-99999) from v_camp_landing_page where date_created >= trunc(dt_current-30)) /* Added @ October 5th 2017 */
-    and ax.cuid not in
-    ( /* find From Mobile App Form */
-        select nvl(CUID,-99999) from AP_CRM.V_CAMP_MOBILE_APP
-    );
-    AP_PUBLIC.CORE_LOG_PKG.pEnd;
-    commit;
-    pStats('gtt_camp_sms_base');
-
+    pStats('CAMP_SMS_REG_TEXT');
+    /*******************************************************************************************************************************************************/
+    
+    /* Building list of smses to sent */
     ptruncate('gtt_camp_sms_counts');
     AP_PUBLIC.CORE_LOG_PKG.pStart('Collecting counts of smses');
-    insert /*+ APPEND PARALLEL(4) */ into gtt_camp_sms_counts
+    insert /*+ APPEND */ into gtt_camp_sms_counts
     select cuid, count(cuid)count_sms from camp_sms_ad_hoc_crm
-    where trunc(last_day(delivery_time)) = trunc(last_day(dt_current))
+    where delivery_time >= trunc(dt_current,'MM')
     and code_promo in
         (
             (select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type ='OFFER REGULAR')
@@ -402,9 +383,9 @@ begin
 
     ptruncate('gtt_camp_sms_last');
     AP_PUBLIC.CORE_LOG_PKG.pStart('Collecting last time of smses sent');
-    insert /*+ APPEND PARALLEL(4) */ into gtt_camp_sms_last
+    insert /*+ APPEND  */ into gtt_camp_sms_last
     select cuid, max(delivery_time)send_date from camp_sms_ad_hoc_crm
-    where trunc(last_day(delivery_time)) = trunc(last_day(dt_current))
+    where delivery_time = trunc(dt_current,'MM')
     and code_promo in
         (
             (select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type ='OFFER REGULAR')
@@ -420,7 +401,7 @@ begin
     ptruncate('gtt_camp_sms_list');
     AP_PUBLIC.CORE_LOG_PKG.pStart('Building list of smses to sent');
     insert /*+ APPEND */ into gtt_camp_sms_list
-    select /*+ PARALLEL(4) USE_HASH(base sc sms sl) */
+    select /*+ USE_HASH(base sc sms sl) */
     base.skp_client, base.cuid, base.contract_id, base.mobile1, base.pilot_flag, base.TDY_PRIORITY, nvl(sc.count_sms,0)count_sms, trunc(dt_current) - nvl(trunc(sl.send_date),trunc(dt_current)-6) last_sms,
 /*        case when nvl(count_sms,0) = 0 then sms.sms_1_5
              when nvl(count_sms,0) = 1 then sms.sms_6_10
@@ -467,11 +448,13 @@ begin
     AP_PUBLIC.CORE_LOG_PKG.pEnd;
     commit;
     pStats('GTT_CAMP_SMS_OFFER');
-    /******************************************************************************************************************************/
+    /*******************************************************************************************************************************************************/
 
+    /* Distributing sms delivery to every hours */
     select count(1) into csize from ap_crm.gtt_camp_sms_offer;
     select distinct text_content, message_code into text_sms, message_code from ap_Crm.camp_cfg_sms_text 
     where campaign_id = to_char(dt_current,'yymm') and sms_type = 'OFFER REGULAR' AND TO_NUMBER(SUBSTR(TEXT_TYPE, -1, 1)) = SMS_COUNT; --and text_type = 'SMS_Dynamic_1';
+    
     if csize > 0 then
 
         select ceil(count(skp_client)/day_count) into csize from ap_crm.gtt_camp_sms_offer;
@@ -492,10 +475,6 @@ begin
              when numsa <= hsize * 8 then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 15:00:00','mm/dd/yyyy hh24:mi:ss')
              when numsa <= hsize * 9 then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 16:00:00','mm/dd/yyyy hh24:mi:ss')
              when numsa <= hsize * 10 then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 17:00:00','mm/dd/yyyy hh24:mi:ss')
---             when numsa <= hsize * 11 then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 18:00:00','mm/dd/yyyy hh24:mi:ss')
---             when numsa <= hsize * 12 then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 19:00:00','mm/dd/yyyy hh24:mi:ss')
---             when numsa <= hsize * 13 then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 20:00:00','mm/dd/yyyy hh24:mi:ss')
---        else to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 20:00:00','mm/dd/yyyy hh24:mi:ss')
         else to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' 17:59:00','mm/dd/yyyy hh24:mi:ss')
         end delivery_time,
         cuid id_cuid, contract_id contract_code, sms_text message, 'N' flag_sent_to_provdr, sysdate dtime_inserted, null dtime_sent_to_provdr, 'CRM' Department, 'DL' comm_status, 'CLS' comm_result,
@@ -512,7 +491,8 @@ begin
           loop
             delivery := to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(horus, '09') || ':00:00';
             insert into ap_CRM.CAMP_sms_ad_hoc_crm values (contact_num, 'GINQ', 'GI_OTHERS', to_timestamp(delivery,'mm/dd/yyyy hh24:mi:ss'), '615898', '3608717024',
-            replace(replace(replace(text_sms,'[credit_amount]','25'),'[instalment]','625rb/bln'),'[nick_name]', case when length(trim(contact_name)) > 12 then 'Nasabah Yth' else 'Yth. ' || case when genders = 'Male' then 'Bpk' when genders = 'Female' then 'Ibu' end || ' ' ||trim(initcap(contact_name)) end),
+            replace(replace(replace(text_sms,'[credit_amount]','25'),'[instalment]','625rb/bln'),'[nick_name]', 
+            case when length(trim(contact_name)) > 12 then 'Nasabah Yth' else 'Yth. ' || case when genders = 'Male' then 'Bpk' when genders = 'Female' then 'Ibu' end || ' ' ||trim(initcap(contact_name)) end),
               'N', sysdate, null,'CRM','DL','CLS',message_code,'SMS_Dynamic_1');
           end loop;
         horus := 8;
@@ -520,7 +500,7 @@ begin
         close cur_mon;
         AP_PUBLIC.CORE_LOG_PKG.pEnd;
         commit;
-        pStats(UPPER('camp_sms_ad_hoc_crm'));
+        --pStats(UPPER('camp_sms_ad_hoc_crm'));
 
         AP_PUBLIC.CORE_LOG_PKG.pStart('UPD:TIME SETTING');
         if not (cur_row%ISOPEN) then
@@ -542,10 +522,6 @@ begin
                      when to_char(delivery_time,'hh24') = '15' then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '08'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss')
                      when to_char(delivery_time,'hh24') = '16' then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '09'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss')
                      when to_char(delivery_time,'hh24') = '17' then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '10'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss')
- /*                    when to_char(delivery_time,'hh24') = '18' then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '11'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss')
-                     when to_char(delivery_time,'hh24') = '19' then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '12'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss')
-                     when to_char(delivery_time,'hh24') = '20' then to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '13'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss')
-  */                 --  else to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '13'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss') end
                      else to_timestamp(to_char(dt_current,'mm/dd/yyyy') || ' ' || to_char(((timestamp '1970-01-01 00:00:00' + numtodsinterval((select dbms_random.value(start_seed,end_seed) from camp_sms_type_timegroup where sms_type = 'SMS OFFER CAMPAIGN' and time_group = '10'), 'SECOND'))), 'HH24:mi:ss'), 'mm/dd/yyyy hh24:mi:ss') end
          where rowid = row_id;
         end loop;
@@ -553,72 +529,58 @@ begin
         AP_PUBLIC.CORE_LOG_PKG.pEnd;
         commit;
         pStats(UPPER('camp_sms_ad_hoc_crm'));
+        /***************************************************************************************************************************************************/
 
         AP_PUBLIC.CORE_LOG_PKG.pStart('Insert to app_bicc.sms_ad_hoc_master_crm');
-/*        insert into app_bicc.sms_ad_hoc_master_crm (id_cuid, text_contract_number, text_phone_number, message, message_code, message_owner, send_to_dwh_reader,
-               dtime_message_inserted, dtime_message_sent, dtime_message_expired)
-        with control as
+        INSERT INTO app_bicc.SMS_AD_HOC_MASTER_CRM
         (
-            select id_cuid || '|' || message_code || '|' || text_phone_number id_cuid from app_bicc.sms_ad_hoc_master_crm
-            where dtime_message_sent >= trunc(dt_current) and message_code in (select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type IN ('OFFER REGULAR', 'APP', 'INBOUND', 'LANDING'))
+            ID_CUID,            TEXT_CONTRACT_NUMBER,
+            TEXT_PHONE_NUMBER,  MESSAGE,
+            MESSAGE_CODE,       MESSAGE_OWNER,
+            SEND_TO_DWH_READER, DTIME_MESSAGE_INSERTED,
+            DTIME_MESSAGE_SENT, DTIME_MESSAGE_EXPIRED
         )
-        select cuid id_cuid, contract_code text_contract_number, phone text_phone_number, message, code_promo message_code, 'CRM' message_owner,
-               'N' send_to_dwh_reader, dt_current dtime_message_inserted, delivery_time dtime_message_sent, trunc(delivery_time) +1 dtime_message_expired
-        from camp_sms_ad_hoc_crm
-        where delivery_time >= trunc(dt_current)
-          and code_promo in (select message_code from camp_cfg_sms_text where campaign_id = to_char(dt_current,'yymm') and sms_type = 'OFFER REGULAR')
-          and (cuid || '|' || code_promo || '|' || phone) not in (select nvl(id_cuid,'-99999999') from control);*/
-				INSERT INTO app_bicc.SMS_AD_HOC_MASTER_CRM
-				(
-						ID_CUID,						TEXT_CONTRACT_NUMBER,
-						TEXT_PHONE_NUMBER,  MESSAGE,
-						MESSAGE_CODE,       MESSAGE_OWNER,
-						SEND_TO_DWH_READER, DTIME_MESSAGE_INSERTED,
-						DTIME_MESSAGE_SENT, DTIME_MESSAGE_EXPIRED
-				)
-				WITH
-				W$1 AS 
-				( 
-						SELECT /*+ FULL(A) */ DISTINCT MESSAGE_CODE
-						FROM AP_CRM.CAMP_CFG_SMS_TEXT A
-						WHERE CAMPAIGN_ID = TO_CHAR(SysDate, 'yymm')
-						AND SMS_TYPE IN ('OFFER REGULAR', 'APP', 'INBOUND', 'LANDING')
-				),
-				W$2 AS 
-				(
-						SELECT /*+ FULL(A) */ DISTINCT MESSAGE_CODE
-						FROM AP_CRM.CAMP_CFG_SMS_TEXT A
-						WHERE CAMPAIGN_ID = TO_CHAR(SysDate, 'yymm')
-						AND SMS_TYPE = 'OFFER REGULAR'
-				),
-				CONTROL AS
-				( 
-						SELECT DISTINCT NVL(A.ID_CUID || '|' || A.MESSAGE_CODE || '|' || A.TEXT_PHONE_NUMBER, '-99999999') ID_CUID
-						FROM APP_BICC.SMS_AD_HOC_MASTER_CRM A
-						JOIN W$1 B ON B.MESSAGE_CODE = A.MESSAGE_CODE
-						WHERE A.DTIME_MESSAGE_SENT >= TRUNC(SysDate)
-				)
-				SELECT A.CUID ID_CUID,
-				A.CONTRACT_CODE TEXT_CONTRACT_NUMBER,
-				A.PHONE TEXT_PHONE_NUMBER,
-				A.MESSAGE,
-				A.CODE_PROMO MESSAGE_CODE,
-				'CRM' MESSAGE_OWNER,
-				'N' SEND_TO_DWH_READER,
-				SysDate DTIME_MESSAGE_INSERTED,
-				A.DELIVERY_TIME DTIME_MESSAGE_SENT,
-				TRUNC(A.DELIVERY_TIME) + 1 DTIME_MESSAGE_EXPIRED
-				FROM AP_CRM.CAMP_SMS_AD_HOC_CRM A
-				JOIN W$2 B ON B.MESSAGE_CODE = A.CODE_PROMO
-				LEFT JOIN CONTROL C ON C.ID_CUID = (A.CUID || '|' || A.CODE_PROMO || '|' || A.PHONE)
-				WHERE A.DELIVERY_TIME >= TRUNC(SysDate)
-				AND C.ID_CUID IS NULL;
+        WITH
+        W$1 AS 
+        ( 
+            SELECT /*+ FULL(A) */ DISTINCT MESSAGE_CODE
+            FROM AP_CRM.CAMP_CFG_SMS_TEXT A
+            WHERE CAMPAIGN_ID = TO_CHAR(SysDate, 'yymm')
+            AND SMS_TYPE IN ('OFFER REGULAR', 'APP', 'INBOUND', 'LANDING')
+        ),
+        W$2 AS 
+        (
+            SELECT /*+ FULL(A) */ DISTINCT MESSAGE_CODE
+            FROM AP_CRM.CAMP_CFG_SMS_TEXT A
+            WHERE CAMPAIGN_ID = TO_CHAR(SysDate, 'yymm')
+            AND SMS_TYPE = 'OFFER REGULAR'
+        ),
+        CONTROL AS
+        ( 
+            SELECT /*+ MATERIALIZE */ DISTINCT NVL(A.ID_CUID || '|' || A.MESSAGE_CODE || '|' || A.TEXT_PHONE_NUMBER, '-99999999') ID_CUID
+            FROM APP_BICC.SMS_AD_HOC_MASTER_CRM A
+            JOIN W$1 B ON B.MESSAGE_CODE = A.MESSAGE_CODE
+            WHERE A.DTIME_MESSAGE_SENT >= TRUNC(SysDate)
+        )
+        SELECT A.CUID ID_CUID,
+               A.CONTRACT_CODE TEXT_CONTRACT_NUMBER,
+               A.PHONE TEXT_PHONE_NUMBER,
+               A.MESSAGE,
+               A.CODE_PROMO MESSAGE_CODE,
+               'CRM' MESSAGE_OWNER,
+               'N' SEND_TO_DWH_READER,
+               SysDate DTIME_MESSAGE_INSERTED,
+               A.DELIVERY_TIME DTIME_MESSAGE_SENT,
+               TRUNC(A.DELIVERY_TIME) + 1 DTIME_MESSAGE_EXPIRED
+        FROM AP_CRM.CAMP_SMS_AD_HOC_CRM A
+        JOIN W$2 B ON B.MESSAGE_CODE = A.CODE_PROMO
+        LEFT JOIN CONTROL C ON C.ID_CUID = (A.CUID || '|' || A.CODE_PROMO || '|' || A.PHONE)
+        WHERE A.DELIVERY_TIME >= TRUNC(SysDate)
+        AND C.ID_CUID IS NULL;
         AP_PUBLIC.CORE_LOG_PKG.pEnd;
         commit;
 
     end if;
 <<finish_line>>
-AP_PUBLIC.CORE_LOG_PKG.pFinish ;
+AP_PUBLIC.CORE_LOG_PKG.pFinish;
 end;
-/
-
